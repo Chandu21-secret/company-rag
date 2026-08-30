@@ -1,737 +1,699 @@
-import re
 import json
+import re
+from typing import Any
 
 from openai import OpenAI
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 from src.config import OPENAI_API_KEY
-
-from src.ingestion import (
-    detect_category,
-    detect_models
-)
-
 from src.retrieval import (
-    search,
-    search_bonhoeffer,
-    filter_dealers,
-    count_dealers,
-    search_dealers
+    qdrant_client,
+    COLLECTION_NAME,
+    create_embedding,
 )
 
-from src.llm import generate_answer
 
-
-# ==================================================
+# ============================================================
 # OPENAI
-# ==================================================
+# ============================================================
 
-openai_client = OpenAI(
-    api_key=OPENAI_API_KEY
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    timeout=30.0,
+    max_retries=2,
 )
 
-QUERY_MODEL = "gpt-4o-mini"
+
+PLANNER_MODEL = "gpt-5.6"
+ANSWER_MODEL = "gpt-5.6"
 
 
-# ==================================================
-# CONSTANTS
-# ==================================================
+# ============================================================
+# HELPERS
+# ============================================================
 
-COUNT_WORDS = [
-    "kitne dealer",
-    "kitna dealer",
-    "kitni dealer",
-    "kitne dealers",
-    "kitna dealers",
-    "kitni dealers",
-    "number of dealers",
-    "how many dealers",
-    "total dealers",
-    "total dealer",
-    "dealer count",
-    "dealers count",
-    "dealer ki sankhya",
-    "dealers ki sankhya"
-]
+def clean_json(text: str) -> str:
 
+    text = str(text or "").strip()
 
-LIST_WORDS = [
-    "kaun kaun",
-    "kaun-kaun",
-    "kon kon",
-    "kon-kon",
-    "kaunse",
-    "kaun se",
-    "which dealers",
-    "dealer batao",
-    "dealers batao",
-    "dealer dikhao",
-    "dealers dikhao",
-    "dealer list",
-    "list of dealers",
-    "naam batao",
-    "naam dikhao",
-    "names batao",
-    "names dikhao"
-]
+    if text.startswith("```"):
 
+        text = re.sub(
+            r"^```(?:json)?",
+            "",
+            text,
+            flags=re.IGNORECASE
+        )
 
-FOLLOWUP_WORDS = [
-    "iska",
-    "iski",
-    "isko",
-    "isme",
-    "iske",
-    "is model",
-    "is product",
-    "uska",
-    "uski",
-    "usko",
-    "usme",
-    "uske",
-    "unka",
-    "unki",
-    "unke"
-]
-
-
-BONHOEFFER_WORDS = [
-    "bonhoeffer",
-    "multi-tool",
-    "multi tool",
-    "multitool",
-    "multiفtool",
-    "euro-trim",
-    "euro trim",
-    "euroفtrim",
-    "hedge trimmer",
-    "hedge trim"
-]
-
-
-STATE_NAMES = [
-    "jammu & kashmir",
-    "jammu and kashmir",
-    "himachal pradesh",
-    "karnataka",
-    "haryana",
-    "punjab",
-    "rajasthan",
-    "uttar pradesh",
-    "uttarakhand",
-    "delhi",
-    "maharashtra",
-    "madhya pradesh",
-    "gujarat",
-    "bihar",
-    "jharkhand",
-    "odisha",
-    "west bengal",
-    "assam",
-    "telangana",
-    "andhra pradesh",
-    "tamil nadu",
-    "kerala",
-    "goa",
-    "chhattisgarh"
-]
-
-
-DISTRICT_NAMES = [
-    "jammu",
-    "mandya",
-    "hamirpur",
-    "gurugram",
-    "faridabad",
-    "panchkula",
-    "fatehabad",
-    "ambala",
-    "karnal"
-]
-
-
-REGION_NAMES = [
-    "north",
-    "south",
-    "east",
-    "west",
-    "central"
-]
-
-
-GENERAL_MESSAGES = [
-    "hi",
-    "hello",
-    "hey",
-    "hii",
-    "hiii",
-    "namaste",
-    "namaskar",
-    "good morning",
-    "good afternoon",
-    "good evening",
-    "good night",
-    "how are you",
-    "how are u",
-    "how r you",
-    "how r u",
-    "kaise ho",
-    "kese ho",
-    "kaisa ho",
-    "kya haal hai",
-    "kya hal hai",
-    "thank you",
-    "thanks",
-    "bye",
-    "goodbye"
-]
-
-
-# ==================================================
-# NORMALIZE
-# ==================================================
-
-def normalize_text(text):
-
-    text = str(text or "").lower()
-
-    text = (
-        text
-        .replace("\xa0", " ")
-        .replace("\u00a0", " ")
-        .replace("\ufeff", "")
-    )
-
-    text = text.replace("-", " ")
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
+        text = re.sub(
+            r"```$",
+            "",
+            text
+        )
 
     return text.strip()
 
 
-# ==================================================
-# CONTAINS ANY
-# ==================================================
-
-def contains_any(
-    text,
-    words
-):
-
-    return any(
-        word in text
-        for word in words
-    )
-
-
-# ==================================================
-# GENERAL CONVERSATION
-# ==================================================
-
-def is_general_conversation(text):
-
-    text = normalize_text(text)
-
-    if text in GENERAL_MESSAGES:
-        return True
-
-    phrases = [
-        "how are you",
-        "how are u",
-        "how r you",
-        "how r u",
-        "kaise ho",
-        "kese ho",
-        "kaisa ho",
-        "kya haal hai",
-        "kya hal hai",
-        "what are you doing",
-        "who are you",
-        "what can you do"
-    ]
-
-    return contains_any(
-        text,
-        phrases
-    )
-
-
-# ==================================================
-# GENERAL ANSWER
-# ==================================================
-
-def generate_general_answer(
-    question,
-    chat_history=None
-):
-
-    history = ""
-
-    if chat_history:
-
-        for item in chat_history[-3:]:
-
-            history += (
-                f"User: {item.get('question', '')}\n"
-                f"AI: {item.get('answer', '')}\n"
-            )
+def safe_int(value, default=5, minimum=1, maximum=50):
 
     try:
 
-        response = openai_client.chat.completions.create(
+        value = int(value)
 
-            model=QUERY_MODEL,
+    except Exception:
 
-            messages=[
+        return default
 
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a friendly company chatbot. "
-                        "Answer casual conversation naturally "
-                        "and briefly."
-                    )
-                },
-
-                {
-                    "role": "user",
-                    "content": (
-                        f"Previous conversation:\n{history}\n"
-                        f"User: {question}"
-                    )
-                }
-            ],
-
-            temperature=0.3,
-
-            max_tokens=100
+    return max(
+        minimum,
+        min(
+            maximum,
+            value
         )
-
-        return (
-            response
-            .choices[0]
-            .message
-            .content
-            .strip()
-        )
-
-    except Exception as e:
-
-        print(
-            "General answer error:",
-            e
-        )
-
-        return "Hello! How can I help you?"
-
-
-# ==================================================
-# LOCATION
-# ==================================================
-
-def detect_location(text):
-
-    text = normalize_text(text)
-
-    district = None
-    state = None
-    region = None
-
-    for name in STATE_NAMES:
-
-        if name in text:
-
-            state = name
-
-            break
-
-
-    for name in DISTRICT_NAMES:
-
-        if name in text:
-
-            district = name
-
-            break
-
-
-    if state in [
-        "jammu & kashmir",
-        "jammu and kashmir"
-    ]:
-
-        if (
-            "jammu district" not in text
-            and "jammu mein" not in text
-            and "jammu me" not in text
-            and "jammu ke" not in text
-            and "jammu ka" not in text
-        ):
-
-            district = None
-
-
-    for name in REGION_NAMES:
-
-        if name in text:
-
-            region = name
-
-            break
-
-
-    return (
-        district,
-        state,
-        region
     )
 
 
-# ==================================================
-# FIELD
-# ==================================================
+# ============================================================
+# OPENAI QUERY PLANNER
+# ============================================================
 
-def detect_field(text):
+def understand_question(
+    question: str,
+    history: list | None = None
+) -> dict[str, Any]:
 
-    text = normalize_text(text)
+    history = history or []
 
-    if (
-        "mobile number" in text
-        or "mobile" in text
-        or "phone number" in text
-        or "phone" in text
-        or "contact number" in text
-    ):
-        return "mobile"
+    recent_history = history[-5:]
 
 
-    if (
-        "gst number" in text
-        or "gst no" in text
-        or "gst" in text
-    ):
-        return "gst_no"
+    history_text = ""
 
+    for item in recent_history:
 
-    if (
-        "email address" in text
-        or "email id" in text
-        or "email" in text
-        or "mail id" in text
-        or "mail" in text
-    ):
-        return "email"
+        if not isinstance(item, dict):
+            continue
 
+        previous_question = str(
+            item.get("question", "")
+        ).strip()
 
-    if (
-        "address" in text
-        or "pata" in text
-    ):
-        return "address"
+        previous_answer = str(
+            item.get("answer", "")
+        ).strip()
 
+        if previous_question:
 
-    if (
-        "contact person" in text
-        or "contact name" in text
-    ):
-        return "contact_person"
-
-
-    if "district" in text:
-        return "district"
-
-
-    if "state" in text:
-        return "state"
-
-
-    if (
-        "pin code" in text
-        or "pincode" in text
-    ):
-        return "pin_code"
-
-
-    if "region" in text:
-        return "region"
-
-
-    if "rsm" in text:
-        return "rsm"
-
-
-    return None
-
-
-# ==================================================
-# GET DEALER NAME
-# ==================================================
-
-def get_dealer_name(result):
-
-    payload = result.payload or {}
-
-    return str(
-        payload.get(
-            "dealer_name",
-            ""
-        ) or ""
-    ).strip()
-
-
-# ==================================================
-# BUILD CONTEXT
-# ==================================================
-
-def build_context(results):
-
-    parts = []
-
-    for result in results:
-
-        payload = result.payload or {}
-
-        parts.append(
-            f"""
-Source: {payload.get('source', '')}
-Page: {payload.get('page', '')}
-
-{payload.get('text', '')}
-"""
-        )
-
-    return "\n\n".join(parts)
-
-
-# ==================================================
-# BONHOEFFER EMAIL
-# ==================================================
-
-def get_bonhoeffer_email(results):
-
-    pattern = (
-        r"[A-Za-z0-9._%+-]+"
-        r"@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
-    )
-
-    for result in results:
-
-        payload = result.payload or {}
-
-        text = str(
-            payload.get(
-                "text",
-                ""
-            )
-        )
-
-        match = re.search(
-            pattern,
-            text
-        )
-
-        if match:
-
-            return match.group(0)
-
-    return None
-
-
-# ==================================================
-# BONHOEFFER PHONE
-# ==================================================
-
-def get_bonhoeffer_phone(results):
-
-    for result in results:
-
-        payload = result.payload or {}
-
-        text = str(
-            payload.get(
-                "text",
-                ""
-            )
-        )
-
-        text = (
-            text
-            .replace("\xa0", " ")
-            .replace("\u00a0", " ")
-        )
-
-
-        match = re.search(
-            r"\+91\s*-\s*(\d{5})\s+(\d{5})",
-            text
-        )
-
-        if match:
-
-            return (
-                "+91-"
-                + match.group(1)
-                + " "
-                + match.group(2)
+            history_text += (
+                f"Previous user: {previous_question}\n"
+                f"Previous assistant: {previous_answer}\n\n"
             )
 
 
-        match = re.search(
-            r"\+91\s*-?\s*(\d{10})",
-            text
-        )
+    prompt = f"""
+You are the query-understanding layer of a company RAG system.
 
-        if match:
+Your job is ONLY to understand the user's question and return
+a JSON retrieval plan.
 
-            number = match.group(1)
+Do NOT answer the question.
 
-            return (
-                "+91-"
-                + number[:5]
-                + " "
-                + number[5:]
-            )
+The company knowledge base contains:
+- product catalogue information
+- machine/model specifications
+- dealer information
+- dealer contact information
+- dealer GST
+- dealer state
+- dealer district
+- dealer region
+- dealer address
+- dealer email
+- dealer contact person
 
+The retrieval database uses these payload fields when available:
+category, model, dealer_name, district, state, region,
+gst_no, mobile, email, address, pin_code, rsm,
+contact_person, source, page, text.
 
-    return None
+You must understand natural language.
+Do not depend on fixed keyword rules.
 
+If the user asks a follow-up such as "iska mobile",
+use conversation history to understand what "iska" refers to.
 
-# ==================================================
-# BONHOEFFER PRODUCTS
-# ==================================================
+Return ONLY valid JSON with this structure:
 
-def get_bonhoeffer_products(results):
-
-    products = []
-
-    for result in results:
-
-        payload = result.payload or {}
-
-        text = normalize_text(
-            payload.get(
-                "text",
-                ""
-            )
-        )
-
-
-        if (
-            "multi tool" in text
-            or "multitool" in text
-            or "multiفtool" in text
-        ):
-
-            if "Multi-Tool" not in products:
-
-                products.append(
-                    "Multi-Tool"
-                )
-
-
-        if (
-            "euro trim" in text
-            or "euroفtrim" in text
-        ):
-
-            if "Euro-Trim" not in products:
-
-                products.append(
-                    "Euro-Trim"
-                )
-
-
-        if (
-            "hedge trimmer" in text
-            or (
-                "hedge" in text
-                and "trimmer" in text
-            )
-        ):
-
-            if "Hedge Trimmer" not in products:
-
-                products.append(
-                    "Hedge Trimmer"
-                )
-
-
-    return products
-
-
-# ==================================================
-# PRODUCT ANSWER
-# ==================================================
-
-def generate_product_answer(question, results):
-    if not results:
-        return "I could not find this information in the company knowledge base."
-
-    q = normalize_text(question)
-    context = build_context(results)
-
-    # Fast direct answers: no LLM call.
-    if "power" in q or "maximum power" in q or "horse power" in q or "hp" in q:
-        match = re.search(r"(\d+(?:\.\d+)?)\s*HP", context, re.IGNORECASE)
-        if match:
-            return f"{match.group(1)} HP"
-
-    if "cc" in q or "displacement" in q:
-        match = re.search(r"(\d+(?:\.\d+)?)\s*(?:CC|cc)", context)
-        if match:
-            return f"{match.group(1)} CC"
-
-    if "rpm" in q:
-        match = re.search(r"(\d+(?:,\d+)*)\s*RPM", context, re.IGNORECASE)
-        if match:
-            return f"{match.group(1)} RPM"
-
-    if "weight" in q:
-        match = re.search(r"(\d+(?:\.\d+)?)\s*(?:kg|kgs)", context, re.IGNORECASE)
-        if match:
-            return f"{match.group(1)} kg"
-
-    prompt = f"""Answer the user's product question using ONLY the company data below.
+{{
+  "intent": "dealer|product|general|unknown",
+  "operation": "search|count|list|lookup",
+  "search_query": "best semantic search query",
+  "filters": {{
+    "category": null,
+    "model": null,
+    "dealer_name": null,
+    "district": null,
+    "state": null,
+    "region": null
+  }},
+  "limit": 8
+}}
 
 Rules:
-- Give the exact information from the context.
-- Do not invent information.
-- Keep the answer short and direct.
-- Never return dots such as ... or **...**.
-- If the answer is not available, say exactly: I could not find this information in the company knowledge base.
 
-Company data:
-{context}
+1. Use null when a filter is not known.
+2. Do not invent a dealer, product, model, state or district.
+3. If the question asks for a number/count, use operation=count.
+4. If it asks for names/list, use operation=list.
+5. If it asks for information about one entity, use operation=lookup.
+6. search_query should preserve important names, models and locations.
+7. Do not answer the user.
+8. Return JSON only.
 
-Question:
+Conversation history:
+{history_text}
+
+Current user question:
 {question}
 """
 
+
+    response = client.responses.create(
+
+        model=PLANNER_MODEL,
+
+        input=prompt
+    )
+
+
+    raw = response.output_text
+
+    raw = clean_json(raw)
+
+
     try:
-        response = openai_client.chat.completions.create(
-            model=QUERY_MODEL,
-            messages=[
-                {"role": "system", "content": "You answer company product questions using only supplied data."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0,
-            max_tokens=80
+
+        plan = json.loads(raw)
+
+    except Exception:
+
+        # Safe fallback if the model ever returns malformed JSON.
+
+        plan = {
+            "intent": "unknown",
+            "operation": "search",
+            "search_query": question,
+            "filters": {},
+            "limit": 8
+        }
+
+
+    if not isinstance(plan, dict):
+
+        plan = {
+            "intent": "unknown",
+            "operation": "search",
+            "search_query": question,
+            "filters": {},
+            "limit": 8
+        }
+
+
+    if not isinstance(
+        plan.get("filters"),
+        dict
+    ):
+
+        plan["filters"] = {}
+
+
+    plan["search_query"] = str(
+
+        plan.get(
+            "search_query",
+            question
         )
-        answer = (response.choices[0].message.content or "").strip()
-        if not answer or answer in ("...", "**...**", "…", "**…**"):
-            return "I could not find this information in the company knowledge base."
-        return answer
-    except Exception as e:
-        print("Product answer error:", e)
-        return "I could not find this information in the company knowledge base."
+
+        or question
+
+    ).strip()
 
 
-# ==================================================
+    plan["operation"] = str(
+
+        plan.get(
+            "operation",
+            "search"
+        )
+
+        or "search"
+
+    ).lower()
+
+
+    plan["intent"] = str(
+
+        plan.get(
+            "intent",
+            "unknown"
+        )
+
+        or "unknown"
+
+    ).lower()
+
+
+    plan["limit"] = safe_int(
+
+        plan.get(
+            "limit",
+            8
+        ),
+
+        default=8,
+
+        minimum=3,
+
+        maximum=20
+    )
+
+
+    return plan
+
+
+# ============================================================
+# BUILD QDRANT FILTER
+# ============================================================
+
+def build_filter(
+    filters: dict
+):
+
+    must = []
+
+
+    # These are database schema fields,
+    # NOT user-question rules.
+
+    allowed_fields = [
+        "category",
+        "model",
+        "dealer_name",
+        "district",
+        "state",
+        "region"
+    ]
+
+
+    for field in allowed_fields:
+
+        value = filters.get(
+            field
+        )
+
+        if value is None:
+            continue
+
+        value = str(
+            value
+        ).strip()
+
+
+        if not value:
+            continue
+
+
+        must.append(
+
+            FieldCondition(
+
+                key=field,
+
+                match=MatchValue(
+                    value=value
+                )
+
+            )
+
+        )
+
+
+    if not must:
+
+        return None
+
+
+    return Filter(
+        must=must
+    )
+
+
+# ============================================================
+# QDRANT RETRIEVAL
+# ============================================================
+
+def retrieve_documents(
+    question: str,
+    plan: dict
+):
+
+    search_query = (
+
+        plan.get(
+            "search_query"
+        )
+
+        or question
+
+    )
+
+
+    filters = plan.get(
+        "filters",
+        {}
+    )
+
+
+    qdrant_filter = build_filter(
+        filters
+    )
+
+
+    # --------------------------------------------------------
+    # Create embedding
+    # --------------------------------------------------------
+
+    query_vector = create_embedding(
+        search_query
+    )
+
+
+    # --------------------------------------------------------
+    # Semantic retrieval
+    # --------------------------------------------------------
+
+    results = qdrant_client.query_points(
+
+        collection_name=COLLECTION_NAME,
+
+        query=query_vector,
+
+        query_filter=qdrant_filter,
+
+        limit=plan.get(
+            "limit",
+            8
+        ),
+
+        with_payload=True,
+
+        with_vectors=False
+
+    ).points
+
+
+    # --------------------------------------------------------
+    # If filtered search returns nothing,
+    # retry semantic search without filter.
+    # --------------------------------------------------------
+
+    if (
+        not results
+        and qdrant_filter is not None
+    ):
+
+        results = qdrant_client.query_points(
+
+            collection_name=COLLECTION_NAME,
+
+            query=query_vector,
+
+            query_filter=None,
+
+            limit=plan.get(
+                "limit",
+                8
+            ),
+
+            with_payload=True,
+
+            with_vectors=False
+
+        ).points
+
+
+    return results
+
+
+# ============================================================
+# COUNT / LIST SUPPORT
+# ============================================================
+
+def retrieve_for_count(
+    plan: dict
+):
+
+    filters = plan.get(
+        "filters",
+        {}
+    )
+
+
+    qdrant_filter = build_filter(
+        filters
+    )
+
+
+    # For exact counts we need all matching records,
+    # not only the top semantic results.
+
+    records = []
+
+    offset = None
+
+
+    while True:
+
+        batch, next_offset = qdrant_client.scroll(
+
+            collection_name=COLLECTION_NAME,
+
+            scroll_filter=qdrant_filter,
+
+            limit=256,
+
+            offset=offset,
+
+            with_payload=True,
+
+            with_vectors=False
+
+        )
+
+
+        records.extend(
+            batch
+        )
+
+
+        if next_offset is None:
+            break
+
+
+        offset = next_offset
+
+
+        # Safety limit
+        if len(records) >= 5000:
+            break
+
+
+    return records
+
+
+# ============================================================
+# FORMAT CONTEXT
+# ============================================================
+
+def build_context(
+    results
+):
+
+    if not results:
+
+        return ""
+
+
+    parts = []
+
+
+    for index, result in enumerate(
+        results,
+        start=1
+    ):
+
+        payload = (
+            result.payload
+            or {}
+        )
+
+
+        parts.append(
+
+            f"""
+--- RESULT {index} ---
+
+Dealer Name:
+{payload.get("dealer_name") or ""}
+
+Model:
+{payload.get("model") or ""}
+
+Category:
+{payload.get("category") or ""}
+
+State:
+{payload.get("state") or ""}
+
+District:
+{payload.get("district") or ""}
+
+Region:
+{payload.get("region") or ""}
+
+GST:
+{payload.get("gst_no") or ""}
+
+Mobile:
+{payload.get("mobile") or ""}
+
+Email:
+{payload.get("email") or ""}
+
+Address:
+{payload.get("address") or ""}
+
+Pin Code:
+{payload.get("pin_code") or ""}
+
+Contact Person:
+{payload.get("contact_person") or ""}
+
+RSM:
+{payload.get("rsm") or ""}
+
+Source:
+{payload.get("source") or ""}
+
+Page:
+{payload.get("page") or ""}
+
+Text:
+{payload.get("text") or ""}
+"""
+        )
+
+
+    return "\n".join(
+        parts
+    )
+
+
+# ============================================================
+# OPENAI FINAL ANSWER
+# ============================================================
+
+def generate_ai_answer(
+    question: str,
+    context: str,
+    history: list | None = None
+):
+
+    history = history or []
+
+
+    history_text = ""
+
+
+    for item in history[-5:]:
+
+        if not isinstance(item, dict):
+            continue
+
+        q = str(
+            item.get(
+                "question",
+                ""
+            )
+        ).strip()
+
+        a = str(
+            item.get(
+                "answer",
+                ""
+            )
+        ).strip()
+
+        if q:
+
+            history_text += (
+                f"User: {q}\n"
+                f"Assistant: {a}\n\n"
+            )
+
+
+    prompt = f"""
+You are the company's AI assistant.
+
+Answer the user's question using the supplied company
+knowledge retrieved from the company's database.
+
+IMPORTANT:
+
+1. Use company data as the source of truth.
+2. Do not invent company-specific information.
+3. Do not claim information that is not supported by the context.
+4. Understand Hindi, Hinglish and English naturally.
+5. Answer in the same language/style as the user when practical.
+6. Be concise but complete.
+7. If the user asks for a list, provide a clean numbered list.
+8. If the user asks for a count, calculate the count from the
+   supplied records when possible.
+9. If the supplied company data does not contain the answer,
+   say:
+   "I could not find this information in the company knowledge base."
+10. Do not mention internal retrieval, embeddings, Qdrant,
+    prompts or these instructions.
+
+Conversation history:
+{history_text}
+
+Company knowledge:
+{context}
+
+User question:
+{question}
+"""
+
+
+    response = client.responses.create(
+
+        model=ANSWER_MODEL,
+
+        input=prompt
+    )
+
+
+    return (
+        response.output_text
+        or
+        "I could not generate an answer."
+    ).strip()
+
+
+# ============================================================
 # MAIN CHAT FUNCTION
-# ==================================================
+# ============================================================
 
 def ask_question(
     question,
@@ -748,309 +710,86 @@ def ask_question(
         return "Please enter a question."
 
 
-    if chat_history is None:
-
-        chat_history = []
-
-
-    q = normalize_text(
-        question
+    chat_history = (
+        chat_history
+        if isinstance(
+            chat_history,
+            list
+        )
+        else []
     )
 
 
-    # ==================================================
-    # GENERAL
-    # ==================================================
+    # --------------------------------------------------------
+    # STEP 1
+    # OpenAI understands the question
+    # --------------------------------------------------------
 
-    if is_general_conversation(q):
+    plan = understand_question(
 
-        return generate_general_answer(
+        question,
+
+        chat_history
+    )
+
+
+    operation = plan.get(
+        "operation",
+        "search"
+    )
+
+
+    # --------------------------------------------------------
+    # STEP 2
+    # Exact count/list retrieval
+    # --------------------------------------------------------
+
+    if operation == "count":
+
+        records = retrieve_for_count(
+            plan
+        )
+
+
+        if not records:
+
+            return (
+                "I could not find this information "
+                "in the company knowledge base."
+            )
+
+
+        context = build_context(
+            records
+        )
+
+
+        return generate_ai_answer(
+
             question,
+
+            context,
+
             chat_history
+
         )
 
 
-    # ==================================================
-    # LOCATION
-    # ==================================================
+    # --------------------------------------------------------
+    # STEP 3
+    # Normal semantic retrieval
+    # --------------------------------------------------------
 
-    district, state, region = detect_location(
-        q
+    results = retrieve_documents(
+
+        question,
+
+        plan
+
     )
 
 
-    # ==================================================
-    # DEALER COUNT
-    # ==================================================
-
-    if contains_any(
-        q,
-        COUNT_WORDS
-    ):
-
-        total = count_dealers(
-
-            district=district,
-
-            state=state,
-
-            region=region
-        )
-
-
-        if district:
-
-            return (
-                f"{district.title()} mein "
-                f"{total} dealers hain."
-            )
-
-
-        if state:
-
-            return (
-                f"{state.title()} mein "
-                f"{total} dealers hain."
-            )
-
-
-        if region:
-
-            return (
-                f"{region.title()} region mein "
-                f"{total} dealers hain."
-            )
-
-
-        return (
-            f"Company mein total "
-            f"{total} dealers hain."
-        )
-
-
-    # ==================================================
-    # DEALER LIST
-    # ==================================================
-
-    if contains_any(
-        q,
-        LIST_WORDS
-    ):
-
-        # ----------------------------------------------
-        # If location missing, use previous question
-        # ----------------------------------------------
-
-        if (
-            not district
-            and not state
-            and not region
-            and chat_history
-        ):
-
-            previous = chat_history[-1].get(
-                "question",
-                ""
-            )
-
-            district, state, region = detect_location(
-                previous
-            )
-
-
-        results = filter_dealers(
-
-            district=district or None,
-
-            state=state or None,
-
-            region=region or None
-        )
-
-
-        if not results:
-
-            return (
-                "I could not find this information "
-                "in the company knowledge base."
-            )
-
-
-        names = []
-
-
-        for result in results:
-
-            name = get_dealer_name(
-                result
-            )
-
-            if name:
-
-                names.append(
-                    name
-                )
-
-
-        # Remove duplicates
-
-        names = list(
-            dict.fromkeys(
-                names
-            )
-        )
-
-
-        if not names:
-
-            return (
-                "I could not find this information "
-                "in the company knowledge base."
-            )
-
-
-        if district:
-
-            location = district.title()
-
-        elif state:
-
-            location = state.title()
-
-        elif region:
-
-            location = (
-                region.title()
-                + " Region"
-            )
-
-        else:
-
-            location = "Company"
-
-
-        lines = []
-
-
-        for index, name in enumerate(
-            names,
-            start=1
-        ):
-
-            lines.append(
-                f"{index}. {name}"
-            )
-
-
-        return (
-            f"{location} mein "
-            f"{len(names)} dealers hain:\n\n"
-            + "\n".join(lines)
-        )
-
-
-    # ==================================================
-    # DEALER FIELD
-    # ==================================================
-
-    field = detect_field(
-        q
-    )
-
-
-    if field:
-
-        results = []
-
-
-        # ----------------------------------------------
-        # Follow-up
-        # ----------------------------------------------
-
-        is_followup = contains_any(
-            q,
-            FOLLOWUP_WORDS
-        )
-
-
-        if (
-            is_followup
-            and chat_history
-        ):
-
-            previous_question = (
-                chat_history[-1]
-                .get(
-                    "question",
-                    ""
-                )
-            )
-
-
-            results = search_dealers(
-                previous_question
-            )
-
-
-        # ----------------------------------------------
-        # Normal dealer search
-        # ----------------------------------------------
-
-        if not results:
-
-            results = search_dealers(
-                question
-            )
-
-
-        if not results:
-
-            return (
-                "I could not find this information "
-                "in the company knowledge base."
-            )
-
-
-        values = []
-
-
-        for result in results:
-
-            payload = result.payload or {}
-
-
-            value = str(
-                payload.get(
-                    field
-                ) or ""
-            ).strip()
-
-
-            if value:
-
-                values.append(
-                    value
-                )
-
-
-        values = list(
-            dict.fromkeys(
-                values
-            )
-        )
-
-
-        if len(values) == 1:
-
-            return values[0]
-
-
-        if values:
-
-            return "\n".join(
-                values
-            )
-
+    if not results:
 
         return (
             "I could not find this information "
@@ -1058,163 +797,22 @@ def ask_question(
         )
 
 
-    # ==================================================
-    # BONHOEFFER
-    # ==================================================
+    # --------------------------------------------------------
+    # STEP 4
+    # OpenAI generates final answer
+    # --------------------------------------------------------
 
-    if contains_any(
-        q,
-        BONHOEFFER_WORDS
-    ):
-
-        results = search_bonhoeffer()
-
-
-        if not results:
-
-            return (
-                "I could not find this information "
-                "in the company knowledge base."
-            )
-
-
-        # ----------------------------------------------
-        # Email
-        # ----------------------------------------------
-
-        if (
-            "email" in q
-            or "mail" in q
-        ):
-
-            email = get_bonhoeffer_email(
-                results
-            )
-
-            if email:
-
-                return email
-
-
-        # ----------------------------------------------
-        # Phone
-        # ----------------------------------------------
-
-        if (
-            "mobile" in q
-            or "phone" in q
-            or "contact number" in q
-        ):
-
-            phone = get_bonhoeffer_phone(
-                results
-            )
-
-            if phone:
-
-                return phone
-
-
-        # ----------------------------------------------
-        # Product list
-        # ----------------------------------------------
-
-        if (
-            "product" in q
-            or "products" in q
-            or "catalog" in q
-            or "catalogue" in q
-            or "kaun kaun" in q
-            or "kaunse" in q
-            or "kon kon" in q
-        ):
-
-            products = get_bonhoeffer_products(
-                results
-            )
-
-
-            if products:
-
-                return (
-                    "Bonhoeffer ke catalogue mein "
-                    "ye products hain:\n\n"
-                    + "\n".join(
-                        f"{i}. {product}"
-                        for i, product
-                        in enumerate(
-                            products,
-                            start=1
-                        )
-                    )
-                )
-
-
-        context = build_context(
-            results
-        )
-
-
-        return generate_answer(
-            question,
-            context
-        )
-
-
-    # ==================================================
-    # PRODUCT / MODEL
-    # ==================================================
-
-    models = detect_models(
-        question
+    context = build_context(
+        results
     )
 
 
-    detected_model = (
-        models[0]
-        if models
-        else None
-    )
+    return generate_ai_answer(
 
+        question,
 
-    category = detect_category(
-        question
-    )
+        context,
 
+        chat_history
 
-    # ==================================================
-    # PRODUCT SEARCH
-    # ==================================================
-
-    results = search(
-
-        query=question,
-
-        limit=3,
-
-        category=category,
-
-        model=detected_model
-    )
-
-
-    # ==================================================
-    # PRODUCT ANSWER
-    # ==================================================
-
-    if results:
-
-        return generate_product_answer(
-            question,
-            results
-        )
-
-
-    # ==================================================
-    # LAST RESORT
-    # ==================================================
-
-    return (
-        "I could not find this information "
-        "in the company knowledge base."
     )
