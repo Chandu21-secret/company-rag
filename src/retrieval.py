@@ -1,7 +1,10 @@
 import uuid
 import re
+import os
+
 from difflib import SequenceMatcher
 
+from dotenv import load_dotenv
 from openai import OpenAI
 
 from qdrant_client import QdrantClient
@@ -22,6 +25,29 @@ from src.config import (
 
 
 # ==================================================
+# ENVIRONMENT
+# ==================================================
+
+load_dotenv()
+
+
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
+
+if not QDRANT_URL:
+    raise RuntimeError(
+        "QDRANT_URL .env mein nahi mila."
+    )
+
+
+if not QDRANT_API_KEY:
+    raise RuntimeError(
+        "QDRANT_API_KEY .env mein nahi mila."
+    )
+
+
+# ==================================================
 # OPENAI
 # ==================================================
 
@@ -31,15 +57,70 @@ openai_client = OpenAI(
 
 
 # ==================================================
-# QDRANT
+# QDRANT CLOUD
 # ==================================================
 
 qdrant_client = QdrantClient(
-    path="./qdrant_storage"
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY,
+    check_compatibility=False
 )
 
 
 COLLECTION_NAME = "company_knowledge"
+
+
+# ==================================================
+# CREATE PAYLOAD INDEXES
+# ==================================================
+
+def create_payload_indexes():
+
+    indexed_fields = [
+        "category",
+        "model",
+        "dealer_name",
+        "district",
+        "state",
+        "region",
+        "gst_no",
+        "mobile",
+        "email"
+    ]
+
+    for field in indexed_fields:
+
+        try:
+
+            qdrant_client.create_payload_index(
+                collection_name=COLLECTION_NAME,
+                field_name=field,
+                field_schema="keyword",
+                wait=True
+            )
+
+            print(
+                f"Index ready: {field}"
+            )
+
+        except Exception as e:
+
+            error_text = str(e).lower()
+
+            if (
+                "already exists" in error_text
+                or "already indexed" in error_text
+            ):
+
+                print(
+                    f"Index already exists: {field}"
+                )
+
+            else:
+
+                print(
+                    f"Index warning for {field}: {e}"
+                )
 
 
 # ==================================================
@@ -61,6 +142,10 @@ def create_collection():
             f"Collection already exists: {COLLECTION_NAME}"
         )
 
+        # Collection already exists.
+        # Make sure indexes also exist.
+        create_payload_indexes()
+
         return
 
     qdrant_client.create_collection(
@@ -78,6 +163,8 @@ def create_collection():
     print(
         f"Collection created: {COLLECTION_NAME}"
     )
+
+    create_payload_indexes()
 
 
 # ==================================================
@@ -193,7 +280,6 @@ def create_embeddings_batch(
 
         return []
 
-
     for start in range(
         0,
         total,
@@ -213,17 +299,12 @@ def create_embeddings_batch(
             f"of {total}..."
         )
 
-
         response = openai_client.embeddings.create(
 
             model=EMBEDDING_MODEL,
 
             input=batch
         )
-
-
-        # OpenAI normally returns items in input order,
-        # but sort by index for safety.
 
         sorted_data = sorted(
 
@@ -232,7 +313,6 @@ def create_embeddings_batch(
             key=lambda item: item.index
         )
 
-
         embeddings = [
 
             item.embedding
@@ -240,11 +320,9 @@ def create_embeddings_batch(
             for item in sorted_data
         ]
 
-
         all_embeddings.extend(
             embeddings
         )
-
 
     return all_embeddings
 
@@ -270,10 +348,6 @@ def store_chunks(chunks):
     print("================================")
 
 
-    # --------------------------------------------------
-    # Get texts
-    # --------------------------------------------------
-
     texts = [
 
         str(
@@ -286,10 +360,6 @@ def store_chunks(chunks):
         for chunk in chunks
     ]
 
-
-    # --------------------------------------------------
-    # Create embeddings in batches
-    # --------------------------------------------------
 
     embeddings = create_embeddings_batch(
 
@@ -306,10 +376,6 @@ def store_chunks(chunks):
             "chunk count."
         )
 
-
-    # --------------------------------------------------
-    # Create Qdrant points
-    # --------------------------------------------------
 
     points = []
 
@@ -363,7 +429,7 @@ def store_chunks(chunks):
                 payload={
 
                     # ----------------------------------
-                    # Common
+                    # COMMON
                     # ----------------------------------
 
                     "text": chunk.get(
@@ -389,7 +455,7 @@ def store_chunks(chunks):
 
 
                     # ----------------------------------
-                    # Dealer
+                    # DEALER
                     # ----------------------------------
 
                     "dealer_name": chunk.get(
@@ -441,12 +507,12 @@ def store_chunks(chunks):
 
 
     # --------------------------------------------------
-    # Upload to Qdrant
+    # UPLOAD
     # --------------------------------------------------
 
     print()
     print(
-        "Uploading data to Qdrant..."
+        "Uploading data to Qdrant Cloud..."
     )
 
 
@@ -456,14 +522,23 @@ def store_chunks(chunks):
 
             collection_name=COLLECTION_NAME,
 
-            points=points
+            points=points,
+
+            wait=True
         )
 
 
     print()
     print(
-        f"{len(points)} chunks stored in Qdrant."
+        f"{len(points)} chunks stored in Qdrant Cloud."
     )
+
+
+    # --------------------------------------------------
+    # MAKE SURE INDEXES EXIST
+    # --------------------------------------------------
+
+    create_payload_indexes()
 
 
 # ==================================================
@@ -947,9 +1022,6 @@ def search_dealers(query):
 
         if dealer_normalized in query_lower:
 
-            # IMPORTANT:
-            # Exact match = only one dealer
-
             return [
                 record
             ]
@@ -1056,8 +1128,6 @@ def search_dealers(query):
         )
 
 
-        # Full-name score
-
         full_score = similarity_score(
 
             dealer_candidate,
@@ -1065,8 +1135,6 @@ def search_dealers(query):
             dealer_normalized
         )
 
-
-        # Word score
 
         query_words = dealer_candidate.split()
 
@@ -1100,8 +1168,6 @@ def search_dealers(query):
 
                 matched_words += 1
 
-
-        # Require complete meaningful match
 
         if len(query_words) >= 2:
 
@@ -1152,6 +1218,7 @@ def search_dealers(query):
         return [
 
             fuzzy_matches[0][1]
+
         ]
 
 
@@ -1320,7 +1387,6 @@ def search(
     model=None
 ):
 
-
     # ==================================================
     # DEALER
     # ==================================================
@@ -1397,7 +1463,7 @@ def search(
 
 
     # ==================================================
-    # QDRANT SEARCH
+    # QDRANT CLOUD SEARCH
     # ==================================================
 
     results = qdrant_client.query_points(
