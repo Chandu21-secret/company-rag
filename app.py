@@ -1,11 +1,8 @@
+from flask import Flask, request, jsonify
 from src.chat import ask_question
+import os
 
-
-print("================================")
-print("COMPANY RAG CHATBOT")
-print("================================")
-print("Type 'exit' to quit.")
-
+app = Flask(__name__)
 
 # ==================================================
 # CHAT MEMORY
@@ -15,35 +12,45 @@ chat_history = []
 
 
 # ==================================================
-# CHAT LOOP
+# HOME
 # ==================================================
 
-while True:
+@app.route("/", methods=["GET"])
+def home():
 
-    question = input("\nYou: ").strip()
-
-
-    # Exit
-    if question.lower() in [
-        "exit",
-        "quit"
-    ]:
-
-        print("Goodbye!")
-
-        break
+    return jsonify({
+        "status": "success",
+        "message": "Company RAG Chatbot API is running"
+    })
 
 
-    # Empty input
-    if not question:
+# ==================================================
+# CHAT API
+# ==================================================
 
-        continue
+@app.route("/chat", methods=["POST"])
+def chat():
 
+    global chat_history
 
     try:
 
+        data = request.get_json()
+
+        if not data:
+            return jsonify({
+                "error": "Request body is required"
+            }), 400
+
+        question = data.get("question", "").strip()
+
+        if not question:
+            return jsonify({
+                "error": "Question is required"
+            }), 400
+
         # ------------------------------------------
-        # Ask question with history
+        # Ask question
         # ------------------------------------------
 
         answer = ask_question(
@@ -51,41 +58,43 @@ while True:
             chat_history
         )
 
-
-        # ------------------------------------------
-        # Print answer
-        # ------------------------------------------
-
-        print(
-            "\nAI:",
-            answer
-        )
-
-
         # ------------------------------------------
         # Save conversation
         # ------------------------------------------
 
         chat_history.append({
-
             "question": question,
-
             "answer": answer
         })
 
-
         # ------------------------------------------
-        # Keep last 10 turns only
+        # Keep last 10 conversations
         # ------------------------------------------
 
         if len(chat_history) > 10:
-
             chat_history = chat_history[-10:]
 
+        return jsonify({
+            "question": question,
+            "answer": answer
+        })
 
     except Exception as e:
 
-        print(
-            "\nError:",
-            e
-        )
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+
+# ==================================================
+# RUN
+# ==================================================
+
+if __name__ == "__main__":
+
+    port = int(os.environ.get("PORT", 10000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
