@@ -23,8 +23,33 @@ client = OpenAI(
     max_retries=2,
 )
 
-PLANNER_MODEL = "gpt-5.6"
-ANSWER_MODEL = "gpt-5.6"
+# IMPORTANT:
+# Use the low-cost model for this RAG chatbot.
+PLANNER_MODEL = "gpt-5.6-luna"
+ANSWER_MODEL = "gpt-5.6-luna"
+
+print("================================")
+print("COMPANY RAG CHATBOT")
+print("================================")
+print(f"Planner Model : {PLANNER_MODEL}")
+print(f"Answer Model  : {ANSWER_MODEL}")
+print(f"Qdrant        : {COLLECTION_NAME}")
+print("================================")
+
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+MAX_HISTORY_TURNS = 2
+MAX_RESULTS = 5
+MAX_LIST_RESULTS = 20
+
+# Keep retrieved text small.
+MAX_TEXT_CHARS = 1800
+
+# Keep previous answers small.
+MAX_HISTORY_ANSWER_CHARS = 500
 
 
 # ============================================================
@@ -32,15 +57,19 @@ ANSWER_MODEL = "gpt-5.6"
 # ============================================================
 
 def clean_json(text: str) -> str:
+
     text = str(text or "").strip()
 
     if text.startswith("```"):
+
         text = re.sub(
             r"^```(?:json)?",
             "",
             text,
             flags=re.IGNORECASE
         )
+
+    if text.endswith("```"):
 
         text = re.sub(
             r"```$",
@@ -57,8 +86,10 @@ def safe_int(
     minimum=1,
     maximum=50
 ):
+
     try:
         value = int(value)
+
     except Exception:
         return default
 
@@ -71,6 +102,78 @@ def safe_int(
     )
 
 
+def normalize_text(value: Any) -> str:
+
+    return re.sub(
+        r"\s+",
+        " ",
+        str(value or "").strip()
+    )
+
+
+def unique_preserve_order(items):
+
+    seen = set()
+    output = []
+
+    for item in items:
+
+        value = normalize_text(item)
+
+        if not value:
+            continue
+
+        key = value.lower()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        output.append(value)
+
+    return output
+
+
+# ============================================================
+# CHAT HISTORY
+# ============================================================
+
+def build_history_text(history):
+
+    history = history or []
+
+    recent_history = history[-MAX_HISTORY_TURNS:]
+
+    parts = []
+
+    for item in recent_history:
+
+        if not isinstance(item, dict):
+            continue
+
+        question = normalize_text(
+            item.get("question", "")
+        )
+
+        answer = normalize_text(
+            item.get("answer", "")
+        )
+
+        if not question:
+            continue
+
+        answer = answer[
+            :MAX_HISTORY_ANSWER_CHARS
+        ]
+
+        parts.append(
+            f"User: {question}\n"
+            f"Assistant: {answer}"
+        )
+
+    return "\n\n".join(parts)
+
+
 # ============================================================
 # OPENAI QUERY PLANNER
 # ============================================================
@@ -80,47 +183,17 @@ def understand_question(
     history: list | None = None
 ) -> dict[str, Any]:
 
-    history = history or []
-
-    recent_history = history[-5:]
-
-    history_text = ""
-
-    for item in recent_history:
-
-        if not isinstance(item, dict):
-            continue
-
-        previous_question = str(
-            item.get(
-                "question",
-                ""
-            )
-        ).strip()
-
-        previous_answer = str(
-            item.get(
-                "answer",
-                ""
-            )
-        ).strip()
-
-        if previous_question:
-
-            history_text += (
-                f"Previous user: {previous_question}\n"
-                f"Previous assistant: {previous_answer}\n\n"
-            )
+    history_text = build_history_text(history)
 
     prompt = f"""
 You are the query-understanding layer of a company RAG system.
 
-Your job is ONLY to understand the user's question and return
-a JSON retrieval plan.
+Your ONLY job is to create a small retrieval plan.
 
-Do NOT answer the question.
+Do NOT answer the user's question.
 
 The company knowledge base contains:
+
 - product catalogue information
 - machine/model specifications
 - dealer information
@@ -133,23 +206,20 @@ The company knowledge base contains:
 - dealer email
 - dealer contact person
 
-The retrieval database uses these payload fields when available:
+Available payload fields:
+
 category, model, dealer_name, district, state, region,
 gst_no, mobile, email, address, pin_code, rsm,
 contact_person, source, page, text.
 
-You must understand natural language.
-Do not depend on fixed keyword rules.
+Return ONLY valid JSON.
 
-If the user asks a follow-up such as "iska mobile",
-use conversation history to understand what "iska" refers to.
-
-Return ONLY valid JSON with this structure:
+Use this structure:
 
 {{
   "intent": "dealer|product|general|unknown",
   "operation": "search|count|list|lookup",
-  "search_query": "best semantic search query",
+  "search_query": "short semantic search query",
   "filters": {{
     "category": null,
     "model": null,
@@ -158,48 +228,58 @@ Return ONLY valid JSON with this structure:
     "state": null,
     "region": null
   }},
-  "limit": 8
+  "limit": 5
 }}
 
 Rules:
 
-1. Use null when a filter is not known.
-2. Do not invent a dealer, product, model, state or district.
-3. If the question asks for a number/count, use operation=count.
-4. If it asks for names/list/all models/all products, use operation=list.
-5. If it asks for information about one entity, use operation=lookup.
-6. search_query should preserve important names, models and locations.
-7. Do not answer the user.
-8. Return JSON only.
+1. Do not invent information.
+2. Use null when a filter is unknown.
+3. If user asks "how many", "kitne", "number of", use count.
+4. If user asks for models/products/all items, use list.
+5. If user asks about one entity, use lookup.
+6. Preserve important product names and locations.
+7. For follow-up questions, use the conversation history.
+8. Keep search_query short.
+9. limit should normally be 5.
+10. Never answer the user's question.
 
 Conversation history:
+
 {history_text}
 
 Current user question:
+
 {question}
 """
 
-    response = client.responses.create(
-        model=PLANNER_MODEL,
-        input=prompt
-    )
-
-    raw = response.output_text
-
-    raw = clean_json(raw)
-
     try:
+
+        response = client.responses.create(
+            model=PLANNER_MODEL,
+            input=prompt,
+            reasoning={
+                "effort": "none"
+            },
+            max_output_tokens=300,
+        )
+
+        raw = clean_json(
+            response.output_text
+        )
 
         plan = json.loads(raw)
 
-    except Exception:
+    except Exception as e:
+
+        print("Planner error:", e)
 
         plan = {
             "intent": "unknown",
             "operation": "search",
             "search_query": question,
             "filters": {},
-            "limit": 8
+            "limit": 5
         }
 
     if not isinstance(plan, dict):
@@ -209,7 +289,7 @@ Current user question:
             "operation": "search",
             "search_query": question,
             "filters": {},
-            "limit": 8
+            "limit": 5
         }
 
     if not isinstance(
@@ -219,45 +299,39 @@ Current user question:
 
         plan["filters"] = {}
 
-    plan["search_query"] = str(
+    plan["search_query"] = normalize_text(
         plan.get(
             "search_query",
             question
         )
-        or question
-    ).strip()
+    ) or question
 
-    plan["operation"] = str(
+    plan["operation"] = normalize_text(
         plan.get(
             "operation",
             "search"
         )
-        or "search"
-    ).lower()
+    ).lower() or "search"
 
-    plan["intent"] = str(
+    plan["intent"] = normalize_text(
         plan.get(
             "intent",
             "unknown"
         )
-        or "unknown"
-    ).lower()
+    ).lower() or "unknown"
 
     plan["limit"] = safe_int(
-        plan.get(
-            "limit",
-            8
-        ),
-        default=8,
+        plan.get("limit", 5),
+        default=5,
         minimum=3,
-        maximum=20
+        maximum=MAX_RESULTS
     )
 
     return plan
 
 
 # ============================================================
-# BUILD QDRANT FILTER
+# QDRANT FILTER
 # ============================================================
 
 def build_filter(
@@ -265,9 +339,6 @@ def build_filter(
 ):
 
     must = []
-
-    # These are database schema fields.
-    # They are not user-question answer rules.
 
     allowed_fields = [
         "category",
@@ -280,16 +351,12 @@ def build_filter(
 
     for field in allowed_fields:
 
-        value = filters.get(
-            field
-        )
+        value = filters.get(field)
 
         if value is None:
             continue
 
-        value = str(
-            value
-        ).strip()
+        value = normalize_text(value)
 
         if not value:
             continue
@@ -312,7 +379,7 @@ def build_filter(
 
 
 # ============================================================
-# QDRANT RETRIEVAL
+# QDRANT SEMANTIC RETRIEVAL
 # ============================================================
 
 def retrieve_documents(
@@ -321,9 +388,7 @@ def retrieve_documents(
 ):
 
     search_query = (
-        plan.get(
-            "search_query"
-        )
+        plan.get("search_query")
         or question
     )
 
@@ -336,53 +401,37 @@ def retrieve_documents(
         filters
     )
 
-    # --------------------------------------------------------
-    # Create embedding
-    # --------------------------------------------------------
-
+    # ONE embedding request.
     query_vector = create_embedding(
         search_query
     )
-
-    # --------------------------------------------------------
-    # Decide retrieval size
-    #
-    # LIST QUESTIONS GET MORE RESULTS
-    #
-    # This helps when catalogue information is spread across
-    # multiple overlapping Vision chunks.
-    # --------------------------------------------------------
 
     operation = str(
         plan.get(
             "operation",
             "search"
         )
-        or "search"
     ).lower()
 
     if operation == "list":
 
-        retrieval_limit = 20
+        retrieval_limit = MAX_LIST_RESULTS
 
     else:
 
         retrieval_limit = plan.get(
             "limit",
-            8
+            MAX_RESULTS
         )
 
     retrieval_limit = safe_int(
         retrieval_limit,
-        default=8,
+        default=MAX_RESULTS,
         minimum=3,
-        maximum=20
+        maximum=MAX_LIST_RESULTS
     )
 
-    # --------------------------------------------------------
-    # Semantic retrieval
-    # --------------------------------------------------------
-
+    # First search with filters.
     results = qdrant_client.query_points(
 
         collection_name=COLLECTION_NAME,
@@ -399,11 +448,8 @@ def retrieve_documents(
 
     ).points
 
-    # --------------------------------------------------------
-    # If filtered search returns nothing,
+    # If filtered search fails,
     # retry without filter.
-    # --------------------------------------------------------
-
     if (
         not results
         and qdrant_filter is not None
@@ -429,10 +475,10 @@ def retrieve_documents(
 
 
 # ============================================================
-# COUNT / LIST SUPPORT
+# EXACT RECORD RETRIEVAL
 # ============================================================
 
-def retrieve_for_count(
+def retrieve_matching_records(
     plan: dict
 ):
 
@@ -444,9 +490,6 @@ def retrieve_for_count(
     qdrant_filter = build_filter(
         filters
     )
-
-    # For exact counts we need all matching records,
-    # not only top semantic results.
 
     records = []
 
@@ -470,17 +513,14 @@ def retrieve_for_count(
 
         )
 
-        records.extend(
-            batch
-        )
+        records.extend(batch)
 
         if next_offset is None:
             break
 
         offset = next_offset
 
-        # Safety limit
-
+        # Safety limit.
         if len(records) >= 5000:
             break
 
@@ -488,11 +528,12 @@ def retrieve_for_count(
 
 
 # ============================================================
-# FORMAT CONTEXT
+# BUILD SMALL CONTEXT
 # ============================================================
 
 def build_context(
-    results
+    results,
+    max_results=MAX_RESULTS
 ):
 
     if not results:
@@ -501,7 +542,7 @@ def build_context(
     parts = []
 
     for index, result in enumerate(
-        results,
+        results[:max_results],
         start=1
     ):
 
@@ -510,62 +551,204 @@ def build_context(
             or {}
         )
 
+        text = normalize_text(
+            payload.get("text", "")
+        )
+
+        # HARD LIMIT on retrieved text.
+        text = text[:MAX_TEXT_CHARS]
+
         parts.append(
             f"""
 --- RESULT {index} ---
 
-Dealer Name:
-{payload.get("dealer_name") or ""}
-
 Model:
-{payload.get("model") or ""}
+{normalize_text(payload.get("model"))}
 
 Category:
-{payload.get("category") or ""}
+{normalize_text(payload.get("category"))}
+
+Dealer Name:
+{normalize_text(payload.get("dealer_name"))}
 
 State:
-{payload.get("state") or ""}
+{normalize_text(payload.get("state"))}
 
 District:
-{payload.get("district") or ""}
+{normalize_text(payload.get("district"))}
 
 Region:
-{payload.get("region") or ""}
-
-GST:
-{payload.get("gst_no") or ""}
+{normalize_text(payload.get("region"))}
 
 Mobile:
-{payload.get("mobile") or ""}
+{normalize_text(payload.get("mobile"))}
 
 Email:
-{payload.get("email") or ""}
-
-Address:
-{payload.get("address") or ""}
-
-Pin Code:
-{payload.get("pin_code") or ""}
+{normalize_text(payload.get("email"))}
 
 Contact Person:
-{payload.get("contact_person") or ""}
-
-RSM:
-{payload.get("rsm") or ""}
-
-Source:
-{payload.get("source") or ""}
-
-Page:
-{payload.get("page") or ""}
+{normalize_text(payload.get("contact_person"))}
 
 Text:
-{payload.get("text") or ""}
+{text}
 """
         )
 
-    return "\n".join(
-        parts
+    return "\n".join(parts)
+
+
+# ============================================================
+# EXTRACT UNIQUE MODELS
+# ============================================================
+
+def extract_unique_models(records):
+
+    models = []
+
+    for record in records:
+
+        payload = (
+            record.payload
+            or {}
+        )
+
+        model = normalize_text(
+            payload.get("model")
+        )
+
+        if model:
+            models.append(model)
+
+    return unique_preserve_order(
+        models
+    )
+
+
+# ============================================================
+# EXTRACT UNIQUE PRODUCTS
+# ============================================================
+
+def extract_unique_products(records):
+
+    products = []
+
+    for record in records:
+
+        payload = (
+            record.payload
+            or {}
+        )
+
+        model = normalize_text(
+            payload.get("model")
+        )
+
+        category = normalize_text(
+            payload.get("category")
+        )
+
+        if model:
+
+            if category:
+                products.append(
+                    f"{model} ({category})"
+                )
+
+            else:
+                products.append(model)
+
+    return unique_preserve_order(
+        products
+    )
+
+
+# ============================================================
+# DIRECT COUNT ANSWER
+# ============================================================
+
+def answer_count_question(
+    question,
+    plan
+):
+
+    records = retrieve_matching_records(
+        plan
+    )
+
+    if not records:
+
+        return (
+            "I could not find this information "
+            "in the company knowledge base."
+        )
+
+    models = extract_unique_models(
+        records
+    )
+
+    # If models exist, count unique models.
+    if models:
+
+        count = len(models)
+
+        return (
+            f"Company knowledge base ke according "
+            f"{count} unique model(s) available hain."
+        )
+
+    # Fallback to unique records.
+    return (
+        f"Company knowledge base me "
+        f"{len(records)} matching record(s) mile."
+    )
+
+
+# ============================================================
+# DIRECT LIST ANSWER
+# ============================================================
+
+def answer_list_question(
+    question,
+    plan
+):
+
+    records = retrieve_matching_records(
+        plan
+    )
+
+    if not records:
+
+        return (
+            "I could not find this information "
+            "in the company knowledge base."
+        )
+
+    models = extract_unique_models(
+        records
+    )
+
+    if not models:
+
+        return (
+            "I could not find the model names "
+            "in the company knowledge base."
+        )
+
+    lines = []
+
+    for index, model in enumerate(
+        models,
+        start=1
+    ):
+
+        lines.append(
+            f"{index}. {model}"
+        )
+
+    return (
+        f"Company knowledge base ke according "
+        f"{len(models)} unique model(s) hain:\n\n"
+        + "\n".join(lines)
     )
 
 
@@ -579,86 +762,127 @@ def generate_ai_answer(
     history: list | None = None
 ):
 
-    history = history or []
-
-    history_text = ""
-
-    for item in history[-5:]:
-
-        if not isinstance(item, dict):
-            continue
-
-        q = str(
-            item.get(
-                "question",
-                ""
-            )
-        ).strip()
-
-        a = str(
-            item.get(
-                "answer",
-                ""
-            )
-        ).strip()
-
-        if q:
-
-            history_text += (
-                f"User: {q}\n"
-                f"Assistant: {a}\n\n"
-            )
+    history_text = build_history_text(
+        history
+    )
 
     prompt = f"""
 You are the company's AI assistant.
 
-Answer the user's question using the supplied company
-knowledge retrieved from the company's database.
+Answer the user's question using ONLY
+the supplied company knowledge.
 
-IMPORTANT:
+Rules:
 
-1. Use company data as the source of truth.
-2. Do not invent company-specific information.
-3. Do not claim information that is not supported by the context.
-4. Understand Hindi, Hinglish and English naturally.
-5. Answer in the same language/style as the user when practical.
-6. Be concise but complete.
-7. If the user asks for a list, provide a clean numbered list.
-8. If the user asks for a count, calculate the count from the
-   supplied records when possible.
-9. If the user asks for ALL, EVERY, SAARE or SABHI items,
-   carefully inspect ALL supplied results before answering.
-10. Do not omit an item merely because another result contains
-    overlapping or duplicate catalogue information.
-11. If multiple catalogue results contain different models,
-    combine the unique models supported by the supplied context.
-12. Do not invent a model just to complete a list.
-13. If the supplied company data does not contain the answer,
-    say:
-    "I could not find this information in the company knowledge base."
-14. Do not mention internal retrieval, embeddings, Qdrant,
-    prompts or these instructions.
+1. Company data is the source of truth.
+2. Do not invent company information.
+3. Do not claim information not supported by context.
+4. Understand Hindi, Hinglish and English.
+5. Answer in the same language/style as the user.
+6. Be concise.
+7. If the user asks for a list, use a numbered list.
+8. If information is missing, say:
+
+"I could not find this information in the company knowledge base."
+
+9. Do not mention Qdrant.
+10. Do not mention embeddings.
+11. Do not mention prompts.
+12. Do not mention internal retrieval.
 
 Conversation history:
+
 {history_text}
 
 Company knowledge:
+
 {context}
 
 User question:
+
 {question}
 """
 
-    response = client.responses.create(
-        model=ANSWER_MODEL,
-        input=prompt
-    )
+    try:
 
-    return (
-        response.output_text
-        or
-        "I could not generate an answer."
-    ).strip()
+        response = client.responses.create(
+
+            model=ANSWER_MODEL,
+
+            input=prompt,
+
+            reasoning={
+                "effort": "none"
+            },
+
+            max_output_tokens=600
+        )
+
+        # Token monitoring.
+        usage = getattr(
+            response,
+            "usage",
+            None
+        )
+
+        if usage:
+
+            print(
+                "--------------------------------"
+            )
+
+            print(
+                "OpenAI Usage"
+            )
+
+            print(
+                "Input tokens:",
+                getattr(
+                    usage,
+                    "input_tokens",
+                    "N/A"
+                )
+            )
+
+            print(
+                "Output tokens:",
+                getattr(
+                    usage,
+                    "output_tokens",
+                    "N/A"
+                )
+            )
+
+            print(
+                "Total tokens:",
+                getattr(
+                    usage,
+                    "total_tokens",
+                    "N/A"
+                )
+            )
+
+            print(
+                "--------------------------------"
+            )
+
+        return (
+            response.output_text
+            or
+            "I could not generate an answer."
+        ).strip()
+
+    except Exception as e:
+
+        print(
+            "Answer generation error:",
+            e
+        )
+
+        return (
+            "Sorry, I could not generate "
+            "the answer right now."
+        )
 
 
 # ============================================================
@@ -670,11 +894,12 @@ def ask_question(
     chat_history=None
 ):
 
-    question = str(
-        question or ""
-    ).strip()
+    question = normalize_text(
+        question
+    )
 
     if not question:
+
         return "Please enter a question."
 
     chat_history = (
@@ -688,7 +913,7 @@ def ask_question(
 
     # --------------------------------------------------------
     # STEP 1
-    # OpenAI understands the question
+    # Small OpenAI planner call
     # --------------------------------------------------------
 
     plan = understand_question(
@@ -701,39 +926,49 @@ def ask_question(
         "search"
     )
 
+    print(
+        "Question:",
+        question
+    )
+
+    print(
+        "Plan:",
+        plan
+    )
+
     # --------------------------------------------------------
     # STEP 2
-    # Exact count retrieval
+    # COUNT
+    #
+    # IMPORTANT:
+    # Do NOT send all records to OpenAI.
     # --------------------------------------------------------
 
     if operation == "count":
 
-        records = retrieve_for_count(
-            plan
-        )
-
-        if not records:
-
-            return (
-                "I could not find this information "
-                "in the company knowledge base."
-            )
-
-        context = build_context(
-            records
-        )
-
-        return generate_ai_answer(
+        return answer_count_question(
             question,
-            context,
-            chat_history
+            plan
         )
 
     # --------------------------------------------------------
     # STEP 3
-    # Semantic retrieval
+    # LIST
     #
-    # For list questions retrieve up to 20 results.
+    # IMPORTANT:
+    # Do NOT send all records to OpenAI.
+    # --------------------------------------------------------
+
+    if operation == "list":
+
+        return answer_list_question(
+            question,
+            plan
+        )
+
+    # --------------------------------------------------------
+    # STEP 4
+    # NORMAL SEARCH / LOOKUP
     # --------------------------------------------------------
 
     results = retrieve_documents(
@@ -749,13 +984,19 @@ def ask_question(
         )
 
     # --------------------------------------------------------
-    # STEP 4
-    # OpenAI generates final answer
+    # STEP 5
+    # SMALL CONTEXT ONLY
     # --------------------------------------------------------
 
     context = build_context(
-        results
+        results,
+        max_results=MAX_RESULTS
     )
+
+    # --------------------------------------------------------
+    # STEP 6
+    # ONE FINAL LLM CALL
+    # --------------------------------------------------------
 
     return generate_ai_answer(
         question,
